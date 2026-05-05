@@ -3,6 +3,7 @@ import asyncio
 import httpx
 from pydantic import BaseModel, model_validator, ConfigDict
 from typing import Any
+from itertools import product
 
 app = FastAPI()
 
@@ -250,7 +251,131 @@ async def get_timetables(request: TimetableRequest):
             for u in active:
                 filtered_lessons[u][mod_code] = common
 
-    # Build response
+    # Build joint assignment of classes per module such that:
+    # - For each module, exactly one class is chosen for every lessonType
+    # - If multiple users take the same module, they get the same class choices
+    # - Choices respect per-user filtered lessons and avoid time conflicts per user
+
+    def lessons_overlap(a: dict, b: dict) -> bool:
+        if a.get("day") != b.get("day"):
+            return False
+        a_start = time_str_to_minutes(a.get("startTime", "0000"))
+        a_end = time_str_to_minutes(a.get("endTime", "0000"))
+        b_start = time_str_to_minutes(b.get("startTime", "0000"))
+        b_end = time_str_to_minutes(b.get("endTime", "0000"))
+        return not (a_end <= b_start or a_start >= b_end)
+
+    # Determine modules that actually need assignment (taken by at least one user)
+    modules_to_assign: list[str] = []
+    module_users: dict[str, list[str]] = {}
+    for username in request.users:
+        config = request.get_user_config(username)
+        all_user_mods = list(config.modules) + [
+            m for m in config.compulsory_classes if m not in config.modules
+        ]
+        for m in all_user_mods:
+            module_users.setdefault(m, []).append(username)
+
+    for m in module_users:
+        modules_to_assign.append(m)
+
+    # Precompute valid options per module: for each lessonType, list of lesson dicts
+    module_options: dict[str, list[list[dict]]] = {}
+    for mod in modules_to_assign:
+        mod_data = modules_by_code.get(mod)
+        if mod_data is None:
+            continue
+        raw_lessons = extract_lessons(mod_data, request.semester)
+        lesson_types = sorted({l.get("lessonType") for l in raw_lessons})
+
+        users_for_mod = module_users.get(mod, [])
+        options_per_type: list[list[dict]] = []
+        impossible = False
+        for lt in lesson_types:
+            classnos_sets: list[set[str]] = []
+            lessons_by_class: dict[str, dict] = {}
+            for u in users_for_mod:
+                lessons = [l for l in filtered_lessons.get(u, {}).get(mod, []) if l.get("lessonType") == lt]
+                classnos = {l.get("classNo") for l in lessons}
+                classnos_sets.append(classnos)
+                for l in lessons:
+                    if l.get("classNo") not in lessons_by_class:
+                        lessons_by_class[l.get("classNo")] = l
+
+            if not classnos_sets:
+                options_per_type.append([])
+                continue
+
+            common_classnos = set.intersection(*classnos_sets)
+            if not common_classnos:
+                impossible = True
+                break
+
+            opts = [lessons_by_class[c] for c in sorted(common_classnos)]
+            options_per_type.append(opts)
+
+        if impossible:
+            raise HTTPException(status_code=400, detail=f"No common class options for module {mod} given user constraints")
+
+        combos: list[list[dict]] = []
+        for combo in product(*options_per_type):
+            ok = True
+            for i in range(len(combo)):
+                for j in range(i + 1, len(combo)):
+                    if lessons_overlap(combo[i], combo[j]):
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if ok:
+                combos.append(list(combo))
+
+        if not combos:
+            raise HTTPException(status_code=400, detail=f"No non-overlapping class combinations for module {mod}")
+
+        module_options[mod] = combos
+
+    # Backtracking: assign one combination per module so that for each user, their assigned lessons do not clash
+    assigned: dict[str, list[dict]] = {}
+    user_selected: dict[str, list[dict]] = {u: [] for u in request.users}
+
+    def backtrack(idx: int) -> bool:
+        if idx >= len(modules_to_assign):
+            return True
+        mod = modules_to_assign[idx]
+        combos = module_options.get(mod, [])
+        users_for_mod = module_users.get(mod, [])
+        for combo in combos:
+            valid = True
+            for u in users_for_mod:
+                for lesson in combo:
+                    if any(lessons_overlap(lesson, assigned_l) for assigned_l in user_selected[u]):
+                        valid = False
+                        break
+                if not valid:
+                    break
+            if not valid:
+                continue
+
+            assigned[mod] = combo
+            for u in users_for_mod:
+                user_selected[u].extend(combo)
+
+            if backtrack(idx + 1):
+                return True
+
+            assigned.pop(mod, None)
+            for u in users_for_mod:
+                for _ in range(len(combo)):
+                    user_selected[u].pop()
+
+        return False
+
+    success = backtrack(0)
+    if not success:
+        raise HTTPException(status_code=400, detail="Unable to find non-conflicting timetables for given constraints")
+
+    # Build per-user response from assigned modules
     user_timetables: list[UserTimetable] = []
     for username in request.users:
         config = request.get_user_config(username)
@@ -258,19 +383,16 @@ async def get_timetables(request: TimetableRequest):
             m for m in config.compulsory_classes if m not in config.modules
         ]
         mod_timetables: list[ModuleTimetable] = []
-        for mod_code in all_user_mods:
-            module_data = modules_by_code.get(mod_code)
+        for mod in all_user_mods:
+            module_data = modules_by_code.get(mod)
             if module_data is None:
                 continue
-            lessons = filtered_lessons[username].get(mod_code, [])
+            lessons = assigned.get(mod, []) if mod in assigned else []
             mod_timetables.append(ModuleTimetable(
-                moduleCode=mod_code,
+                moduleCode=mod,
                 title=module_data.get("title", ""),
                 lessons=[Lesson(**lesson) for lesson in lessons],
             ))
-        user_timetables.append(UserTimetable(
-            username=username,
-            timetable=mod_timetables,
-        ))
+        user_timetables.append(UserTimetable(username=username, timetable=mod_timetables))
 
     return user_timetables
