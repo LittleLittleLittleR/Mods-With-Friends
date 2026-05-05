@@ -1,4 +1,5 @@
 annotated-doc==0.0.4
+httpx==0.28.1
 annotated-types==0.7.0
 anyio==4.13.0
 click==8.3.3
