@@ -88,19 +88,24 @@ class ModuleTimetable(BaseModel):
     moduleCode: str
     title: str
     lessons: list[Lesson]
+    sharedConflict: bool | None = None
 
 
 class UserTimetable(BaseModel):
     username: str
     timetable: list[ModuleTimetable]
+    nusmods_link: str | None = None
 
 
 # ---------- helpers ----------
 
 async def fetch_module(client: httpx.AsyncClient, module_code: str) -> dict:
     url = NUSMODS_API.format(moduleCode=module_code)
+    print(f"Fetching {module_code} from NUSMods...")
+    print(f"URL: {url}")
     response = await client.get(url)
     if response.status_code != 200:
+        print(f"Failed to fetch module {module_code}: {response.status_code}")
         raise HTTPException(
             status_code=404,
             detail=f"Module '{module_code}' not found on NUSMods."
@@ -224,6 +229,11 @@ async def get_timetables(request: TimetableRequest):
 
     modules_by_code = {data["moduleCode"]: data for data in results}
 
+    # Store raw lessons per module for later index mapping
+    raw_lessons_by_module: dict[str, list[dict]] = {}
+    for mod_code, mod_data in modules_by_code.items():
+        raw_lessons_by_module[mod_code] = extract_lessons(mod_data, request.semester)
+
     # Pre-compute filtered lessons per user per module
     filtered_lessons: dict[str, dict[str, list[dict]]] = {}
     for username in request.users:
@@ -281,6 +291,9 @@ async def get_timetables(request: TimetableRequest):
 
     # Precompute valid options per module: for each lessonType, list of lesson dicts
     module_options: dict[str, list[list[dict]]] = {}
+    # module_user_options holds per-user combos for modules where a common assignment isn't possible
+    module_user_options: dict[str, dict[str, list[list[dict]]]] = {}
+
     for mod in modules_to_assign:
         mod_data = modules_by_code.get(mod)
         if mod_data is None:
@@ -289,8 +302,11 @@ async def get_timetables(request: TimetableRequest):
         lesson_types = sorted({l.get("lessonType") for l in raw_lessons})
 
         users_for_mod = module_users.get(mod, [])
+        # Attempt to find common classNos across users for each lesson type
         options_per_type: list[list[dict]] = []
-        impossible = False
+        common_possible = True
+        lessons_by_class_global: dict[str, dict] = {}
+        common_classnos_per_type: list[list[str]] = []
         for lt in lesson_types:
             classnos_sets: list[set[str]] = []
             lessons_by_class: dict[str, dict] = {}
@@ -304,36 +320,78 @@ async def get_timetables(request: TimetableRequest):
 
             if not classnos_sets:
                 options_per_type.append([])
+                common_classnos_per_type.append([])
                 continue
 
             common_classnos = set.intersection(*classnos_sets)
             if not common_classnos:
-                impossible = True
-                break
+                common_possible = False
+                common_classnos_per_type.append([])
+            else:
+                common_classnos_per_type.append(sorted(common_classnos))
 
-            opts = [lessons_by_class[c] for c in sorted(common_classnos)]
-            options_per_type.append(opts)
+            # record global sample lessons
+            for k, v in lessons_by_class.items():
+                lessons_by_class_global[k] = v
 
-        if impossible:
-            raise HTTPException(status_code=400, detail=f"No common class options for module {mod} given user constraints")
-
-        combos: list[list[dict]] = []
-        for combo in product(*options_per_type):
-            ok = True
-            for i in range(len(combo)):
-                for j in range(i + 1, len(combo)):
-                    if lessons_overlap(combo[i], combo[j]):
-                        ok = False
+        if common_possible:
+            # build combos using common classnos
+            opts_per_type = [[lessons_by_class_global[c] for c in classnos] for classnos in common_classnos_per_type]
+            combos: list[list[dict]] = []
+            for combo in product(*opts_per_type):
+                ok = True
+                for i in range(len(combo)):
+                    for j in range(i + 1, len(combo)):
+                        if lessons_overlap(combo[i], combo[j]):
+                            ok = False
+                            break
+                    if not ok:
                         break
-                if not ok:
-                    break
-            if ok:
-                combos.append(list(combo))
+                if ok:
+                    combos.append(list(combo))
+            if not combos:
+                # No valid combo for this module; skip it (will be returned empty)
+                pass
+            else:
+                module_options[mod] = combos
+        else:
+            # cannot find a single common assignment across users; compute per-user combos
+            module_user_options[mod] = {}
+            for u in users_for_mod:
+                opts_per_type_user: list[list[dict]] = []
+                skip_user = False
+                for lt in lesson_types:
+                    lessons = [l for l in filtered_lessons.get(u, {}).get(mod, []) if l.get("lessonType") == lt]
+                    if not lessons:
+                        # user has no option for this lessonType -> skip this module for this user
+                        skip_user = True
+                        break
+                    # group by classNo and pick one representative lesson per classNo
+                    by_class: dict[str, dict] = {}
+                    for l in lessons:
+                        by_class.setdefault(l.get("classNo"), l)
+                    opts_per_type_user.append(list(by_class.values()))
 
-        if not combos:
-            raise HTTPException(status_code=400, detail=f"No non-overlapping class combinations for module {mod}")
+                if skip_user:
+                    continue
 
-        module_options[mod] = combos
+                combos_user: list[list[dict]] = []
+                for combo in product(*opts_per_type_user):
+                    ok = True
+                    for i in range(len(combo)):
+                        for j in range(i + 1, len(combo)):
+                            if lessons_overlap(combo[i], combo[j]):
+                                ok = False
+                                break
+                        if not ok:
+                            break
+                    if ok:
+                        combos_user.append(list(combo))
+                if not combos_user:
+                    # No valid combo for this user in this module; skip it
+                    pass
+                else:
+                    module_user_options[mod][u] = combos_user
 
     # Backtracking: assign one combination per module so that for each user, their assigned lessons do not clash
     assigned: dict[str, list[dict]] = {}
@@ -343,6 +401,10 @@ async def get_timetables(request: TimetableRequest):
         if idx >= len(modules_to_assign):
             return True
         mod = modules_to_assign[idx]
+        # If this module has per-user options (no common choice), skip in global backtrack
+        if mod not in module_options:
+            return backtrack(idx + 1)
+
         combos = module_options.get(mod, [])
         users_for_mod = module_users.get(mod, [])
         for combo in combos:
@@ -372,10 +434,49 @@ async def get_timetables(request: TimetableRequest):
         return False
 
     success = backtrack(0)
-    if not success:
-        raise HTTPException(status_code=400, detail="Unable to find non-conflicting timetables for given constraints")
+    # If backtracking fails, continue anyway with best-effort (some modules may be empty or marked as conflicts)
 
+    # Assign non-shared modules per user (modules present in module_user_options)
+    per_user_assigned: dict[str, dict[str, list[dict]]] = {u: {} for u in request.users}
+
+    def assign_nonshared_for_user(u: str, mods: list[str], idx: int) -> bool:
+        if idx >= len(mods):
+            return True
+        mod = mods[idx]
+        combos = module_user_options.get(mod, {}).get(u, [])
+        if not combos:
+            return False
+        for combo in combos:
+            # check conflicts with already selected lessons for user
+            if any(lessons_overlap(lesson, assigned_l) for lesson in combo for assigned_l in user_selected[u]):
+                continue
+            # apply
+            per_user_assigned[u][mod] = combo
+            user_selected[u].extend(combo)
+            if assign_nonshared_for_user(u, mods, idx + 1):
+                return True
+            # undo
+            user_selected[u] = [l for l in user_selected[u] if l not in combo]
+            per_user_assigned[u].pop(mod, None)
+        return False
+
+    # Run per-user assignment
+    for u in request.users:
+        mods_for_user = [m for m in modules_to_assign if m in module_user_options and u in module_user_options[m]]
+        if not assign_nonshared_for_user(u, mods_for_user, 0):
+            # If we cannot find a per-user assignment without conflicts, mark as best-effort and skip
+            # leave per_user_assigned[u] for those modules empty; we'll still return response with a conflict flag
+            pass
     # Build per-user response from assigned modules
+    # Lesson type abbreviation mapping for NUSMods links
+    lesson_type_abbrev = {
+        "Lecture": "LEC",
+        "Recitation": "REC",
+        "Laboratory": "LAB",
+        "Tutorial": "TUT",
+        "Sectional Teaching": "SEC",
+    }
+    
     user_timetables: list[UserTimetable] = []
     for username in request.users:
         config = request.get_user_config(username)
@@ -383,16 +484,67 @@ async def get_timetables(request: TimetableRequest):
             m for m in config.compulsory_classes if m not in config.modules
         ]
         mod_timetables: list[ModuleTimetable] = []
+        nusmods_params: dict[str, str] = {}
+        
         for mod in all_user_mods:
             module_data = modules_by_code.get(mod)
             if module_data is None:
                 continue
-            lessons = assigned.get(mod, []) if mod in assigned else []
+            if mod in assigned:
+                lessons = assigned.get(mod, [])
+                conflict_flag = False
+            elif mod in per_user_assigned.get(username, {}):
+                lessons = per_user_assigned[username].get(mod, [])
+                conflict_flag = True
+            else:
+                lessons = []
+                conflict_flag = None
+
             mod_timetables.append(ModuleTimetable(
                 moduleCode=mod,
                 title=module_data.get("title", ""),
                 lessons=[Lesson(**lesson) for lesson in lessons],
+                sharedConflict=conflict_flag,
             ))
-        user_timetables.append(UserTimetable(username=username, timetable=mod_timetables))
+            
+            # Build NUSMods link parameter for this module
+            raw_lessons = raw_lessons_by_module.get(mod, [])
+            if raw_lessons and lessons:
+                # Map each assigned lesson to its index in raw_lessons
+                lesson_type_indices: dict[str, list[int]] = {}
+                for assigned_lesson in lessons:
+                    lesson_type = assigned_lesson.get("lessonType")
+                    class_no = assigned_lesson.get("classNo")
+                    # Find the index of this lesson in raw_lessons
+                    for idx, raw_lesson in enumerate(raw_lessons):
+                        if raw_lesson.get("lessonType") == lesson_type and raw_lesson.get("classNo") == class_no:
+                            if lesson_type not in lesson_type_indices:
+                                lesson_type_indices[lesson_type] = []
+                            lesson_type_indices[lesson_type].append(idx)
+                            break
+                
+                # Format as "LESSONTYPE:(index1,index2,...)" using abbreviated lesson types
+                param_parts = []
+                for lt in sorted(lesson_type_indices.keys()):
+                    indices = sorted(set(lesson_type_indices[lt]))  # deduplicate and sort
+                    lt_abbrev = lesson_type_abbrev.get(lt, lt)  # use abbreviation or original if not found
+                    param_parts.append(f"{lt_abbrev}:({','.join(map(str, indices))})")
+                nusmods_params[mod] = ";".join(param_parts)
+            else:
+                # Module has no assigned lessons, add empty parameter
+                nusmods_params[mod] = ""
+        
+        # Construct NUSMods share link
+        nusmods_link = None
+        if nusmods_params:
+            query_parts = [f"{mod}={param}" for mod, param in nusmods_params.items()]
+            query_string = "&".join(query_parts)
+            nusmods_link = f"https://nusmods.com/timetable/sem-{request.semester}/share?{query_string}"
+        
+        user_timetables.append(UserTimetable(
+            username=username, 
+            timetable=mod_timetables,
+            nusmods_link=nusmods_link
+        ))
 
     return user_timetables
